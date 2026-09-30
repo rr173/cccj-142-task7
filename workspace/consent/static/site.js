@@ -1,6 +1,80 @@
 boot("site", "app", async main => {
+  const user = getUser();
+  const INST = user.inst_id;
   let current = null; // 当前选中的本机构对象
+
+  // ---------- 设备可信登记 ----------
+  function deviceBannerHtml() {
+    const info = DeviceAuth.certInfo(INST, "site");
+    if (info) {
+      return `<div class="card okbox" id="devBanner">
+        本机已完成可信登记：设备证书 ${esc(info.cert_id)}（第 ${info.gen} 代）·
+        可落款角色 ${esc((info.roles||[]).join("/"))}。所有落款/执行确认都将由本机私钥签署。
+        <button class="small ghost" id="devInspect">自检状态</button>
+      </div>`;
+    }
+    return `<div class="card" id="devBanner">
+      <h2>本站设备可信登记（首次使用必填）</h2>
+      <p class="muted">在本机生成终端签名密钥（私钥不出设备），粘贴本机构安全管理员/现场负责人签发的
+        一次性注册码完成登记。未登记设备不能新增签名槽记录或执行确认。</p>
+      <div class="row">
+        <div style="flex:2"><label>一次性注册码</label><input id="devCode" placeholder="粘贴注册码"></div>
+        <div><label>设备标识</label><input id="devLabel" value="现场终端"></div>
+        <div style="flex:0 0 auto"><label>&nbsp;</label><button id="devRegister">登记本机</button></div>
+      </div>
+      <div id="devMsg"></div>
+    </div>`;
+  }
+
+  async function renderBanner() {
+    const old = document.getElementById("devBanner");
+    const wrap = document.createElement("div");
+    wrap.innerHTML = deviceBannerHtml();
+    const fresh = wrap.firstElementChild;
+    if (old) old.replaceWith(fresh); else main.prepend(fresh);
+    bindBanner(fresh);
+  }
+  function bindBanner(el) {
+    const reg = el.querySelector("#devRegister");
+    if (reg) reg.onclick = async () => {
+      const box = el.querySelector("#devMsg");
+      const code = el.querySelector("#devCode").value.trim();
+      const label = el.querySelector("#devLabel").value.trim() || "现场终端";
+      if (!code) { toast(box, new Error("请粘贴一次性注册码")); return; }
+      try {
+        await DeviceAuth.register(INST, "site", code, label);
+        await renderBanner();
+      } catch (e) { toast(box, e); }
+    };
+    const insp = el.querySelector("#devInspect");
+    if (insp) insp.onclick = async () => {
+      try {
+        const st = await DeviceAuth.inspect(INST, "site");
+        alert(`设备 ${st.device_id}\n证书 ${st.cert_id}（第 ${st.gen} 代）\n状态：${st.status}` +
+              `${st.quarantined ? "\n⚠ 该设备已被隔离" : ""}\n有效期内：${st.within_validity}`);
+      } catch (e) { alert(e.message); }
+    };
+  }
+
   main.innerHTML = `
+  <div id="bannerSlot"></div>
+  <div class="card">
+    <h2>本站设备可信管理</h2>
+    <p class="muted">签发一次性设备注册码（明文仅此一次显示）；查看本站设备与证书代次、即时隔离、
+      颁发轮换授权；每条状态变更都可在设备审计中核对凭据。</p>
+    <div class="row">
+      <div><label>注册码可用角色</label>
+        <select id="rcRole">
+          <option value="site">现场设备(site)</option>
+          <option value="subject">主体设备(subject)</option>
+          <option value="witness">见证设备(witness)</option>
+        </select></div>
+      <div><label>有效期(分钟)</label><input id="rcMin" type="number" value="60"></div>
+      <div style="flex:0 0 auto"><label>&nbsp;</label><button id="rcIssue">签发注册码</button></div>
+    </div>
+    <div id="rcMsg"></div>
+    <div id="devAdmin"></div>
+  </div>
   <div class="card">
     <h2>本机构办理对象</h2>
     <table><thead><tr><th>选择</th><th>对象</th><th>首选语种</th><th>人群条件</th></tr></thead>
@@ -8,6 +82,62 @@ boot("site", "app", async main => {
   </div>
 
   <div id="workArea"></div>`;
+  await renderBanner();
+  await renderDeviceAdmin();
+
+  async function renderDeviceAdmin() {
+    const wrap = document.getElementById("devAdmin");
+    let devices = [];
+    try { devices = await api("GET", "/api/devices"); } catch (e) { return; }
+    wrap.innerHTML = `
+      <details style="margin-top:8px"><summary>本站设备（${devices.length}）与注册码</summary>
+        <div id="rcList"></div>
+        <table style="margin-top:8px"><thead><tr><th>设备</th><th>标识</th><th>证书代次/状态</th>
+          <th>隔离</th><th>操作</th></tr></thead><tbody>
+        ${devices.map(d => `<tr>
+          <td class="hash">${esc(d.device_id)}</td><td>${esc(d.device_label)}</td>
+          <td>${d.certificates.map(c => `${esc(c.cert_id)} v${c.gen} <span class="muted">[${esc(c.status)}]</span>`).join("<br>")}</td>
+          <td>${d.quarantined ? `<span class="pill no">${esc(d.quarantined_reason||"")}</span>` : '<span class="pill ok">正常</span>'}</td>
+          <td>
+            ${d.quarantined ? "" : `<button class="small danger" data-q="${esc(d.device_id)}">隔离</button>`}
+            <button class="small ghost" data-rot="${esc(d.current_cert_id)}">轮换授权</button>
+          </td></tr>`).join("")}
+        </tbody></table>
+      </details>`;
+    wrap.querySelectorAll("[data-q]").forEach(b => b.onclick = async () => {
+      const reason = prompt("隔离原因（必填）");
+      if (!reason) return;
+      try { await api("POST", "/api/devices/quarantine", { device_id: b.dataset.q, reason });
+        await renderDeviceAdmin();
+      } catch (e) { alert(e.message); }
+    });
+    wrap.querySelectorAll("[data-rot]").forEach(b => b.onclick = async () => {
+      try { const r = await api("POST", "/api/devices/rotate/prepare", { cert_id: b.dataset.rot });
+        prompt("一次性轮换授权码（10 分钟内由该设备双签完成轮换）：", r.rotation_nonce);
+      } catch (e) { alert(e.message); }
+    });
+    try {
+      const codes = await api("GET", "/api/devices/register-codes");
+      document.getElementById("rcList").innerHTML =
+        `<table><thead><tr><th>编号</th><th>角色</th><th>状态</th><th>到期</th></tr></thead><tbody>` +
+        codes.map(c => `<tr><td class="hash">${esc(c.code_ref)}</td><td>${esc(c.roles.join(","))}</td>
+          <td>${esc(c.status)}</td><td class="muted">${esc(c.expires_at)}</td></tr>`).join("") +
+        "</tbody></table>";
+    } catch { /* ignore */ }
+  }
+  document.getElementById("rcIssue").onclick = async () => {
+    const box = document.getElementById("rcMsg");
+    try {
+      const r = await api("POST", "/api/devices/register-codes", {
+        roles: [document.getElementById("rcRole").value],
+        minutes: Number(document.getElementById("rcMin").value || 60),
+      });
+      box.innerHTML = `<div class="okbox">一次性注册码（仅显示一次，请当面/带外交付）：
+        <div class="hash" style="font-size:15px">${esc(r.code)}</div>
+        编号 ${esc(r.code_ref)} · 角色 ${esc(r.roles.join(","))} · ${r.minutes} 分钟有效</div>`;
+      await renderDeviceAdmin();
+    } catch (e) { toast(box, e); }
+  };
 
   const subjects = await api("GET", "/api/subjects");
   document.getElementById("subjRows").innerHTML = subjects.map(s => `
@@ -99,9 +229,19 @@ boot("site", "app", async main => {
 
     document.querySelectorAll("[data-sign]").forEach(b => b.onclick = async () => {
       try {
-        await api("POST", `/api/sessions/${b.dataset.sign}/sign`, { role: "site_owner" });
+        const sid = b.dataset.sign;
+        const sess = sessions.find(x => x.id === sid);
+        const attestation = await DeviceAuth.attest("sign", {
+          instId: INST, certRole: "site", role: "site_owner",
+          sessionId: sid, bodyDigest: sess.material.body_hash,
+        });
+        await api("POST", `/api/sessions/${sid}/sign`, { role: "site_owner", attestation });
         await refreshAll();
-      } catch (e) { alert(e.message); }
+      } catch (e) {
+        alert(e.message + (e.code ? ` [${e.code}]` : ""));
+        if (["cert_rotated", "cert_invalid", "device_quarantined", "device_not_registered"]
+            .includes(e.code)) await renderBanner();
+      }
     });
     document.querySelectorAll("[data-tokens]").forEach(b => b.onclick = async () => {
       try {
@@ -131,7 +271,14 @@ boot("site", "app", async main => {
     const purpose = document.getElementById("purpose").value || null;
     try {
       if (doExecute) {
-        const r = await api("POST", `/api/subjects/${current.id}/execute`, { op, purpose });
+        const bodyDigest = await CT.digestHex(
+          { subject_id: current.id, op, purpose: purpose ?? null });
+        const attestation = await DeviceAuth.attest("execute", {
+          instId: INST, certRole: "site", role: "site",
+          sessionId: null, bodyDigest,
+        });
+        const r = await api("POST", `/api/subjects/${current.id}/execute`,
+          { op, purpose, attestation });
         box.innerHTML = r.result === "performed"
           ? `<div class="okbox">✅ 已执行确认（#${r.execution_id}），依据 ${esc(r.basis.family)} v${r.basis.version}
              <div class="hash">${esc(r.basis.body_hash.slice(0, 20))}…</div>获准范围：${opList(r.scope)}</div>`

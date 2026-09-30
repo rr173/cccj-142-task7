@@ -17,6 +17,7 @@ USERS = [
     # id, inst, role, login, password, name
     ("u-admin", None, "admin", "admin", "admin-pass", "规则维护员"),
     ("u-site-a", "INST-A", "site", "sitea", "site-pass", "A院现场负责人"),
+    ("u-site-a2", "INST-A", "site", "sitea2", "site-pass", "A院现场负责人乙"),
     ("u-site-b", "INST-B", "site", "siteb", "site-pass", "B院现场负责人"),
     ("u-wang", "INST-A", "subject", "wang", "wang-pass", "王 participant"),
     ("u-li", "INST-A", "subject", "li", "li-pass", "李 participant"),

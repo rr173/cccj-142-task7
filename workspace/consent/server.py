@@ -111,6 +111,21 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"user": self._safe_user(p), "subject": s})
                 if path == "/api/institutions":
                     return self._send(200, engine.list_institutions(conn))
+                if path == "/api/server-key":
+                    # 公开：库外核对设备证书/挑战/凭据只需签发根公钥
+                    return self._send(200, {"alg": "CT-CA-ED25519/v1",
+                                            "public_hex": engine.server_public_hex(conn)})
+                if path == "/api/devices":
+                    p = self._principal()
+                    return self._send(200, engine.list_devices(conn, p))
+                if path == "/api/devices/register-codes":
+                    p = self._principal()
+                    return self._send(200, engine.list_register_codes(conn, p))
+                if path.startswith("/api/devices/audit"):
+                    p = self._principal()
+                    q = self._qs()
+                    return self._send(200, engine.list_device_audit(
+                        conn, p, device_id=q.get("device_id"), limit=int(q.get("limit", 200))))
                 if path == "/api/materials":
                     p = self._principal()
                     q = self._qs()
@@ -237,13 +252,17 @@ class Handler(BaseHTTPRequestHandler):
 
                 m = _PAT["session_sign"].match(path)
                 if m:
-                    # 见证者可持一次性令牌免登录；参与人/现场负责人必须登录
-                    p = self._principal(required=(body.get("role") != "witness"))
+                    # 见证者可持一次性令牌免登录；参与人/现场负责人必须登录。
+                    # 三类入口都必须随请求携带设备证明（证书+挑战+终端签名）。
+                    p = self._principal(required=False)
+                    if body.get("role") != "witness" and p is None:
+                        raise EngineError("unauthenticated", "缺少登录令牌", 401)
                     code, resp = engine.sign(
                         conn, m.group(1), body.get("role"),
                         signer_name=body.get("signer_name"), token=body.get("token"),
                         principal=p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
+                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"),
+                        attestation=body.get("attestation"))
                     return self._send(code, resp)
 
                 m = _PAT["session_revoke"].match(path)
@@ -251,7 +270,8 @@ class Handler(BaseHTTPRequestHandler):
                     p = self._principal()
                     code, resp = engine.revoke(
                         conn, m.group(1), p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
+                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"),
+                        attestation=body.get("attestation"))
                     return self._send(code, resp)
 
                 m = _PAT["subject_execute"].match(path)
@@ -262,8 +282,32 @@ class Handler(BaseHTTPRequestHandler):
                     code, resp = engine.execute(
                         conn, s["id"], body.get("op"), purpose=body.get("purpose"),
                         principal=p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
+                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"),
+                        attestation=body.get("attestation"))
                     return self._send(code, resp)
+
+                # ---------- 设备可信登记 / 挑战 / 自检 / 轮换 ----------
+                if path == "/api/devices/register-codes":
+                    p = self._principal()
+                    return self._send(200, engine.create_register_code(conn, p, body))
+                if path == "/api/devices/register":
+                    # 终端登记无登录：凭现场签发的一次性注册码 + 本机公钥 + CSR 自证
+                    return self._send(201, engine.register_device(conn, body))
+                if path == "/api/devices/challenge":
+                    return self._send(200, engine.issue_challenge(conn, body))
+                if path == "/api/devices/inspect":
+                    return self._send(200, engine.inspect_device(conn, body))
+                if path == "/api/devices/rotate/prepare":
+                    p = self._principal()
+                    return self._send(200, engine.prepare_rotation(conn, p, body))
+                if path == "/api/devices/rotate":
+                    return self._send(200, engine.rotate_device(conn, body))
+                if path == "/api/devices":
+                    p = self._principal()
+                    return self._send(200, engine.list_devices(conn, p))
+                if path == "/api/devices/quarantine":
+                    p = self._principal()
+                    return self._send(200, engine.quarantine_device(conn, p, body))
 
                 raise EngineError("not_found", "接口不存在", 404)
             finally:
@@ -297,6 +341,11 @@ def main():
     dbmod.init_db()
     import seed
     seed.ensure_seed(dbmod.get_conn())
+    c0 = dbmod.get_conn()
+    try:
+        engine.server_key(c0)  # 首启生成设备签发根密钥（已存在则复用）
+    finally:
+        c0.close()
     port = int(os.environ.get("CONSENT_PORT", "8088"))
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True

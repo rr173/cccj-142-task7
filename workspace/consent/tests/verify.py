@@ -15,9 +15,13 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from client import Client, login, call, parallel, start, restart, stop, BASE  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import device as dm  # noqa: E402
+from client import (Client, login, call, parallel, start, restart, stop, BASE,  # noqa: E402
+                    DevTerminal)
 
 PASS, FAIL = [], []
+SUBJ_DEV = SITE_DEV = SITE2_DEV = WIT_DEV = WITB_DEV = None
 
 
 def check(name, cond, detail=""):
@@ -29,21 +33,30 @@ def section(t):
     print("\n=== " + t + " ===")
 
 
-def witness_sign(session_id, token, name="见证人-周", idem=None):
+def witness_sign(session_id, token, name="见证人-周", idem=None, body_hash=None, dev=None):
+    dev = dev or WIT_DEV
+    att = dev.attestation("sign", "witness", session_id, body_hash) if body_hash else None
     return call("POST", f"/api/sessions/{session_id}/sign",
-                {"role": "witness", "signer_name": name, "token": token}, idem=idem)
+                {"role": "witness", "signer_name": name, "token": token,
+                 "attestation": att}, idem=idem)
 
 
-def complete_three_role(subject_cli, site_cli, subject_id, material_id):
+def complete_three_role(subject_cli, site_cli, subject_dev, site_dev, witness_dev,
+                        subject_id, material_id):
     code, s = site_cli("POST", f"/api/subjects/{subject_id}/sessions", {"material_id": material_id})
     assert code == 201, s
     sid = s["id"]
+    bh = s["material"]["body_hash"]
     wtoken = s["slot_tokens"]["witness"]
-    code, r = subject_cli("POST", f"/api/sessions/{sid}/sign", {"role": "subject"})
+    code, r = subject_cli("POST", f"/api/sessions/{sid}/sign",
+                          {"role": "subject",
+                           "attestation": subject_dev.attestation("sign", "subject", sid, bh)})
     assert code == 200 and r["result"] == "signed", r
-    code, r = witness_sign(sid, wtoken)
+    code, r = witness_sign(sid, wtoken, body_hash=bh, dev=witness_dev)
     assert code == 200 and r["result"] == "signed", r
-    code, r = site_cli("POST", f"/api/sessions/{sid}/sign", {"role": "site_owner"})
+    code, r = site_cli("POST", f"/api/sessions/{sid}/sign",
+                       {"role": "site_owner",
+                        "attestation": site_dev.attestation("sign", "site_owner", sid, bh)})
     assert code == 200 and r["result"] == "completed", r
     return sid, r["permit_id"]
 
@@ -60,6 +73,15 @@ def main():
     wang, _ = login("wang", "wang-pass")
     li, _ = login("li", "li-pass")
     zhao, _ = login("zhao", "zhao-pass")
+
+    # 三类本站设备可信登记（主体/现场/见证）
+    global SUBJ_DEV, SITE_DEV, WIT_DEV
+    SUBJ_DEV = DevTerminal("INST-A", "subject", "王主体设备").register(sitea)
+    LI_DEV = DevTerminal("INST-A", "subject", "李主体设备").register(sitea)
+    SITE_DEV = DevTerminal("INST-A", "site", "A站现场设备").register(sitea)
+    SITE2_DEV = DevTerminal("INST-A", "site", "A站现场设备乙").register(sitea)
+    WIT_DEV = DevTerminal("INST-A", "witness", "A站见证设备").register(sitea)
+    WITB_DEV = DevTerminal("INST-B", "witness", "B站见证设备").register(siteb)
 
     def publish(family, body, *, scope=("blood_draw", "imaging", "medication", "sample_reuse"),
                 cond=None, reconsent=None, inst="INST-A"):
@@ -81,7 +103,7 @@ def main():
     e = [x for x in elig if x["family"] == "GENERAL-TRIAL"][0]
     check("吻合材料可开单（机构/语种/条件全部吻合）", e["eligible"] is True, e)
 
-    sid, permit = complete_three_role(wang, sitea, "subj-wang", v1["id"])
+    sid, permit = complete_three_role(wang, sitea, SUBJ_DEV, SITE_DEV, WIT_DEV, "subj-wang", v1["id"])
     check("三角色齐备后生成有效许可", bool(permit))
 
     code, session = wang("GET", f"/api/sessions/{sid}")
@@ -99,7 +121,11 @@ def main():
     check("查询说明获准范围", set(["blood_draw", "imaging", "medication", "sample_reuse"])
           <= set(chk["scope"]), chk["scope"])
     check("查询尚缺条件为空", chk["missing"] is None, chk)
-    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {"op": "blood_draw"})
+    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {
+        "op": "blood_draw",
+        "attestation": SITE_DEV.attestation(
+            "execute", "site", None,
+            dm.digest_hex({"subject_id": "subj-wang", "op": "blood_draw", "purpose": None}))})
     check("采血执行确认成功并引用旧依据",
           exe["result"] == "performed" and exe["basis"]["version"] == 1, exe)
 
@@ -110,8 +136,13 @@ def main():
     code, s = sitea("POST", "/api/subjects/subj-li/sessions", {"material_id": m_nowit["id"]})
     sid2 = s["id"]
     check("材料要求见证者角色", "witness" in [x["role"] for x in s["slots"]])
-    code, _ = li("POST", f"/api/sessions/{sid2}/sign", {"role": "subject"})
-    code, _ = sitea("POST", f"/api/sessions/{sid2}/sign", {"role": "site_owner"})
+    bh2 = s["material"]["body_hash"]
+    code, _ = li("POST", f"/api/sessions/{sid2}/sign",
+                 {"role": "subject",
+                  "attestation": LI_DEV.attestation("sign", "subject", sid2, bh2)})
+    code, _ = sitea("POST", f"/api/sessions/{sid2}/sign",
+                    {"role": "site_owner",
+                     "attestation": SITE_DEV.attestation("sign", "site_owner", sid2, bh2)})
     code, sess_view = sitea("GET", f"/api/sessions/{sid2}")
     check("现场能看到具体缺项=witness", sess_view["remaining_roles"] == ["witness"],
           sess_view["remaining_roles"])
@@ -120,12 +151,16 @@ def main():
           chk["allowed"] is False and chk["reason"] == "no_permit"
           and any(o["session_id"] == sid2 and "witness" in o["remaining_roles"]
                   for o in chk["missing"]["open_sessions"]), chk)
-    code, exe = sitea("POST", "/api/subjects/subj-li/execute", {"op": "medication"})
+    code, exe = sitea("POST", "/api/subjects/subj-li/execute", {
+        "op": "medication",
+        "attestation": SITE_DEV.attestation(
+            "execute", "site", None,
+            dm.digest_hex({"subject_id": "subj-li", "op": "medication", "purpose": None}))})
     check("缺见证者时执行确认被拒", exe["result"] == "denied" and exe["reason"] == "no_permit",
           exe)
     # 补齐见证者（最后一个角色）后引擎在同一笔签署里生成许可
     code, tks = sitea("POST", f"/api/sessions/{sid2}/tokens", {})
-    code, rw = witness_sign(sid2, tks["tokens"]["witness"], "见证人-缺项补齐")
+    code, rw = witness_sign(sid2, tks["tokens"]["witness"], "见证人-缺项补齐", body_hash=bh2)
     check("见证者补齐即完成全部必签角色",
           code == 200 and rw["result"] == "completed" and rw["permit_id"], rw)
     code, chk = sitea("GET", "/api/subjects/subj-li/check?op=medication")
@@ -137,12 +172,16 @@ def main():
     m_dup = publish("DUP", "DUP v1 正文")
     code, s = sitea("POST", "/api/subjects/subj-wang/sessions", {"material_id": m_dup["id"]})
     sid3 = s["id"]
+    bh3 = s["material"]["body_hash"]
     same_idem = "dup-key-001"
+    att_dup1 = SITE_DEV.attestation("sign", "site_owner", sid3, bh3)
+    att_dup2 = SITE2_DEV.attestation("sign", "site_owner", sid3, bh3)
     r1, r2 = parallel(
         lambda: sitea("POST", f"/api/sessions/{sid3}/sign",
-                      {"role": "site_owner"}, idem=same_idem),
+                      {"role": "site_owner", "attestation": att_dup1}, idem=same_idem),
         lambda: call("POST", f"/api/sessions/{sid3}/sign",
-                     {"role": "site_owner", "idempotency_key": same_idem},
+                     {"role": "site_owner", "attestation": att_dup2,
+                      "idempotency_key": same_idem},
                      token=sitea.token),
     )
     check("两个终端都拿到 200", r1[0] == 200 and r2[0] == 200, (r1, r2))
@@ -162,26 +201,33 @@ def main():
     n_site = sum(1 for x in sess3["slots"] if x["role"] == "site_owner" and x["filled"])
     check("槽位只有一笔有效签名", n_site == 1)
 
-    # 提交目标不同：另一现场账号(B院)不能占这个槽位
-    code, r = siteb("POST", f"/api/sessions/{sid3}/sign", {"role": "site_owner"})
+    # 提交目标不同：另一现场账号(B院)持本站证明也不能占这个槽位（身份机构不符）
+    code, r = siteb("POST", f"/api/sessions/{sid3}/sign",
+                    {"role": "site_owner",
+                     "attestation": SITE_DEV.attestation("sign", "site_owner", sid3, bh3)})
     check("不同机构/目标的提交被拒绝且不改变归属",
           code in (403, 404), (code, r))
-    # 见证者错误链接 / 已用链接
-    code, r = witness_sign(sid3, "bad-token")
+    # 见证者错误链接 / 已用链接（仍须持有效见证设备证明，链接本身一次性）
+    code, r = witness_sign(sid3, "bad-token", body_hash=bh3)
     check("无效见证链接被拒绝", code == 403 and r["error"] == "invalid_token", r)
     wtok = s["slot_tokens"]["witness"]
-    witness_sign(sid3, wtok, "见证人-周")
-    code, r = witness_sign(sid3, wtok, "见证人-周")
+    witness_sign(sid3, wtok, "见证人-周", body_hash=bh3)
+    code, r = witness_sign(sid3, wtok, "见证人-周", body_hash=bh3)
     check("一次性见证链接用后即失效", code == 403 and r["error"] == "invalid_token", r)
 
     # ---------------- 场景 4：办理途中停用材料 ----------------
     section("场景4 办理途中停用材料")
     code, s4 = sitea("POST", "/api/subjects/subj-li/sessions", {"material_id": v1["id"]})
     sid4 = s4["id"]
-    code, _ = li("POST", f"/api/sessions/{sid4}/sign", {"role": "subject"})
+    bh4 = s4["material"]["body_hash"]
+    code, _ = li("POST", f"/api/sessions/{sid4}/sign",
+                 {"role": "subject",
+                  "attestation": LI_DEV.attestation("sign", "subject", sid4, bh4)})
     code, ret = admin("POST", f"/api/materials/{v1['id']}/retire", {})
     check("维护员停用成功", code == 200 and ret["status"] == "retired", ret)
-    code, r = sitea("POST", f"/api/sessions/{sid4}/sign", {"role": "site_owner"})
+    code, r = sitea("POST", f"/api/sessions/{sid4}/sign",
+                    {"role": "site_owner",
+                     "attestation": SITE_DEV.attestation("sign", "site_owner", sid4, bh4)})
     check("停用后在途会话拒绝新落款", code == 409 and r["error"] == "material_retired", r)
     code, sv = sitea("GET", f"/api/sessions/{sid4}")
     check("在途会话收敛为 blocked 且记录冻结时刻", sv["status"] == "blocked" and sv["blocked_at"])
@@ -197,8 +243,12 @@ def main():
     # ---------------- 场景 5：修订触发再次同意 ----------------
     section("场景5 修订触发再次同意")
     rc1 = publish("RC", "RC v1 正文")
-    sidr, prc = complete_three_role(wang, sitea, "subj-wang", rc1["id"])
-    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {"op": "imaging"})
+    sidr, prc = complete_three_role(wang, sitea, SUBJ_DEV, SITE_DEV, WIT_DEV, "subj-wang", rc1["id"])
+    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {
+        "op": "imaging",
+        "attestation": SITE_DEV.attestation(
+            "execute", "site", None,
+            dm.digest_hex({"subject_id": "subj-wang", "op": "imaging", "purpose": None}))})
     check("v1 下影像已执行（后续冻结不追溯）", exe["result"] == "performed"
           and exe["basis"]["version"] == 1, exe)
     # 发布 v2：正文变化 + 对 imaging/medication 要求再次同意
@@ -215,11 +265,15 @@ def main():
     code, hist = sitea("GET", "/api/subjects/subj-wang/executions")
     done = [x for x in hist if x["op"] == "imaging" and x["result"] == "performed"]
     check("此前完成的操作保留旧依据 v1", done and done[-1]["version"] == 1, done)
-    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {"op": "medication"})
+    code, exe = sitea("POST", "/api/subjects/subj-wang/execute", {
+        "op": "medication",
+        "attestation": SITE_DEV.attestation(
+            "execute", "site", None,
+            dm.digest_hex({"subject_id": "subj-wang", "op": "medication", "purpose": None}))})
     check("冻结期执行确认被拒且未落越权记录", exe["result"] == "denied"
           and exe["reason"] == "frozen_reconsent", exe)
     # 新版补签齐备后解锁
-    sidr2, prc2 = complete_three_role(wang, sitea, "subj-wang", rc2["id"])
+    sidr2, prc2 = complete_three_role(wang, sitea, SUBJ_DEV, SITE_DEV, WIT_DEV, "subj-wang", rc2["id"])
     code, chk = sitea("GET", "/api/subjects/subj-wang/check?op=imaging")
     check("新版补签齐备后解锁，依据升级到 v2",
           chk["allowed"] and chk["basis"]["version"] == 2 and chk["basis"]["permit_id"] == prc2,
@@ -228,7 +282,7 @@ def main():
     # ---------------- 场景 6：无关修订继续放行 ----------------
     section("场景6 不改变许可范围的修订")
     ni1 = publish("NOIMP", "NOIMP v1 正文", scope=["blood_draw"])
-    complete_three_role(wang, sitea, "subj-wang", ni1["id"])
+    complete_three_role(wang, sitea, SUBJ_DEV, SITE_DEV, WIT_DEV, "subj-wang", ni1["id"])
     ni2 = publish("NOIMP", "NOIMP v2 正文（仅文字澄清，无再次同意要求）", scope=["blood_draw"])
     check("澄清性修订另立版本但不带再次同意标记",
           ni2["version"] == 2 and ni2["requires_reconsent"] is False)
@@ -241,7 +295,10 @@ def main():
     cr1 = publish("CRASH", "CRASH v1 正文")
     code, s7 = sitea("POST", "/api/subjects/subj-wang/sessions", {"material_id": cr1["id"]})
     sid7 = s7["id"]
-    code, r = wang("POST", f"/api/sessions/{sid7}/sign", {"role": "subject"})
+    bh7 = s7["material"]["body_hash"]
+    code, r = wang("POST", f"/api/sessions/{sid7}/sign",
+                   {"role": "subject",
+                    "attestation": SUBJ_DEV.attestation("sign", "subject", sid7, bh7)})
     subj_ts = r["signed_at"]
     # 签署途中出现新版本：重启后续签也不能被挪到新版本
     cr2 = publish("CRASH", "CRASH v2 正文（会话已开，不应挪动）")
@@ -256,9 +313,11 @@ def main():
     check("已取得的签名与落款时刻重启后不变", ts_after == subj_ts, (subj_ts, ts_after))
     # 重新拿见证链接（旧链接哈希在库，现场重新签发；用 slots tokens 接口）
     code, tks = sitea("POST", f"/api/sessions/{sid7}/tokens", {})
-    code, rw = witness_sign(sid7, tks["tokens"]["witness"], "见证人-恢复")
+    code, rw = witness_sign(sid7, tks["tokens"]["witness"], "见证人-恢复", body_hash=bh7)
     check("重启后见证签署成功", code == 200 and rw["result"] == "signed", rw)
-    code, rs = sitea("POST", f"/api/sessions/{sid7}/sign", {"role": "site_owner"})
+    code, rs = sitea("POST", f"/api/sessions/{sid7}/sign",
+                     {"role": "site_owner",
+                      "attestation": SITE_DEV.attestation("sign", "site_owner", sid7, bh7)})
     check("重启后补齐全部角色并出许可（依据仍是 v1）",
           rs["result"] == "completed" and rs["session"]["material"]["version"] == 1, rs)
     code, permits = wang("GET", "/api/subjects/subj-wang/permits")
@@ -267,11 +326,18 @@ def main():
     # ---------------- 场景 8：撤销与执行确认竞争 ----------------
     section("场景8 撤销与执行确认竞争")
     race1 = publish("RACE", "RACE v1 正文", scope=["medication"])
-    sid8, pid8 = complete_three_role(wang, sitea, "subj-wang", race1["id"])
+    sid8, pid8 = complete_three_role(wang, sitea, SUBJ_DEV, SITE_DEV, WIT_DEV, "subj-wang", race1["id"])
+    rev_att = SUBJ_DEV.attestation(
+        "revoke", "subject", sid8,
+        dm.digest_hex({"action": "revoke", "session_id": sid8}))
+    exe_att = SITE_DEV.attestation(
+        "execute", "site", None,
+        dm.digest_hex({"subject_id": "subj-wang", "op": "medication", "purpose": None}))
     rr, ee = parallel(
-        lambda: wang("POST", f"/api/sessions/{sid8}/revoke", {}, idem="rev-race-1"),
+        lambda: wang("POST", f"/api/sessions/{sid8}/revoke",
+                     {"attestation": rev_att}, idem="rev-race-1"),
         lambda: sitea("POST", "/api/subjects/subj-wang/execute",
-                      {"op": "medication"}, idem="exe-race-1"),
+                      {"op": "medication", "attestation": exe_att}, idem="exe-race-1"),
     )
     check("竞争双方都收敛为确定响应", rr[0] == 200 and ee[0] == 200, (rr, ee))
     exe_res = ee[1]
@@ -307,10 +373,12 @@ def main():
     check("重复撤销幂等", rv2["result"] in ("already_revoked", "revoked")
           and rv2.get("replayed") is True, rv2)
     code, hist = sitea("GET", "/api/subjects/subj-wang/executions")
-    n_med = [x for x in hist if x["op"] == "medication"]
+    # 只核对被撤销的 RACE 许可：其用药至多一次 performed（撤销前竞争赢家），其后再无 performed。
+    race_med = [x for x in hist if x["op"] == "medication" and x["permit_id"] == pid8]
     check("撤销后没有任何新增越权用药记录",
-          sum(1 for x in n_med if x["result"] == "performed") <= 1
-          and all(x["result"] == "denied" for x in n_med[1:]), n_med)
+          sum(1 for x in race_med if x["result"] == "performed") <= 1
+          and all(x["result"] == "denied" for x in race_med
+                  if x["result"] != "performed"), race_med)
 
     # ---------------- 附加：PII 隔离 / 权限 / 未批准译文 ----------------
     section("附加 隔离与权限")
@@ -327,8 +395,11 @@ def main():
     check("维护员全局审计中参与人身份打码",
           all(e.get("subject_id") != "subj-wang" for e in adaudit if e.get("subject_id")),
           [e for e in adaudit if e.get("subject_id")][:3])
-    code, r = admin("POST", f"/api/sessions/{sid}/sign", {"role": "subject"})
-    check("规则维护员不能替人落款", code == 403, r)
+    code, r = admin("POST", f"/api/sessions/{sid}/sign",
+                    {"role": "subject",
+                     "attestation": SUBJ_DEV.attestation("sign", "subject", sid,
+                                                          v1["body_hash"])})
+    check("规则维护员不能替人落款（持有效设备证明也越权）", code == 403, r)
     code, r = admin("GET", "/api/subjects")
     check("规则维护员无法浏览参与人 PII 列表", code == 403, r)
     # 未批准译文：只发布英文版，首选语种 zh 的办理界面不得拼接它

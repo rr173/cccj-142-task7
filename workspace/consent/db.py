@@ -96,7 +96,10 @@ CREATE TABLE IF NOT EXISTS signatures(
   signer_name TEXT NOT NULL,
   body_hash TEXT NOT NULL,                    -- 签署时核对的封存指纹
   sig_hash TEXT NOT NULL UNIQUE,              -- (会话,角色,落款人,指纹) 去重
-  created_at TEXT NOT NULL                    -- 只写不改
+  created_at TEXT NOT NULL,                   -- 只写不改
+  device_id TEXT,                             -- 修复后：绑定的设备（旧记录为 NULL）
+  cert_id TEXT,                               -- 绑定的终端证书代次
+  attest_nonce TEXT                           -- 设备挑战随机数（与 device_attestations 对应）
 );
 
 CREATE TABLE IF NOT EXISTS permits(
@@ -160,7 +163,118 @@ CREATE TABLE IF NOT EXISTS auth_tokens(
   user_id TEXT NOT NULL REFERENCES users(id),
   created_at TEXT NOT NULL
 );
+
+-- ============================================================ 设备可信登记
+-- 服务端签发根密钥：首启生成、随库持久化；旧公钥始终保留，历史证明重启/换钥后仍可验
+CREATE TABLE IF NOT EXISTS server_keys(
+  kid INTEGER PRIMARY KEY CHECK(kid = 1),
+  alg TEXT NOT NULL,
+  public_hex TEXT NOT NULL,
+  seed_hex TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 现场管理员签发的一次性设备注册码（明文仅创建时回显一次，库内不可逆推）
+CREATE TABLE IF NOT EXISTS register_codes(
+  code_hash TEXT PRIMARY KEY,                  -- sha256(明文码)
+  code_ref TEXT NOT NULL,                      -- 中性编号（审计/列表用）
+  inst_id TEXT NOT NULL REFERENCES institutions(id),
+  roles_json TEXT NOT NULL,                    -- 允许设备申请的落款角色
+  minutes INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','consumed','revoked')),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  device_id TEXT
+);
+
+-- 已登记设备（一台终端浏览器一个设备标识；可被即时隔离）
+CREATE TABLE IF NOT EXISTS devices(
+  id TEXT PRIMARY KEY,                        -- D-xxxx
+  inst_id TEXT NOT NULL REFERENCES institutions(id),
+  device_label TEXT NOT NULL,
+  current_cert_id TEXT,
+  quarantined INTEGER NOT NULL DEFAULT 0,
+  quarantined_reason TEXT,
+  quarantined_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_devices_inst ON devices(inst_id);
+
+-- 设备证书代次：绑定机构/设备/角色/有效期/代次/终端公钥；轮换置 rotated，隔离置 quarantined
+CREATE TABLE IF NOT EXISTS device_certs(
+  id TEXT PRIMARY KEY,                        -- C-xxxx
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  inst_id TEXT NOT NULL,
+  gen INTEGER NOT NULL,
+  roles_json TEXT NOT NULL,
+  public_hex TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK(status IN ('active','rotated','quarantined')),
+  not_before_ms INTEGER NOT NULL,
+  not_after_ms INTEGER NOT NULL,
+  envelope_json TEXT NOT NULL,                -- 服务端签发的自描述证书信封
+  created_at TEXT NOT NULL,
+  rotated_at TEXT,
+  UNIQUE(device_id, gen)
+);
+CREATE INDEX IF NOT EXISTS idx_certs_device ON device_certs(device_id);
+
+-- 已签发挑战（仅持久化必要绑定字段；不回显终端签名）
+CREATE TABLE IF NOT EXISTS challenges(
+  nonce TEXT PRIMARY KEY,
+  cert_id TEXT NOT NULL REFERENCES device_certs(id),
+  inst_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  session_id TEXT,
+  role TEXT NOT NULL,
+  body_digest TEXT NOT NULL,
+  not_before_ms INTEGER NOT NULL,
+  not_after_ms INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+-- 一次性证书轮换授权码（现场管理员签发，终端须用旧+新私钥双签）
+CREATE TABLE IF NOT EXISTS rotation_nonces(
+  nonce TEXT PRIMARY KEY,
+  cert_id TEXT NOT NULL REFERENCES device_certs(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  expires_at_ms INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+-- 设备审计：每一次经设备证明而成立的状态变更在此留下凭据（与业务变更同一事务落盘）。
+-- 非空唯一约束保证：有设备审计行必有已消费随机数；崩溃恢复不会对同一 nonce 写第二次变更。
+CREATE TABLE IF NOT EXISTS device_attestations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nonce TEXT NOT NULL UNIQUE,
+  cert_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  inst_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  session_id TEXT,
+  role TEXT NOT NULL,
+  request_fp TEXT NOT NULL,
+  terminal_sig TEXT NOT NULL,
+  challenge_sig TEXT NOT NULL,
+  target TEXT,                                  -- 业务对象（会话/参与人）
+  outcome TEXT NOT NULL,                        -- signed/completed/withdrawn/revoked/performed/...
+  record_ref TEXT,                              -- 业务记录引用（执行号等）
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attest_device ON device_attestations(device_id, id);
+CREATE INDEX IF NOT EXISTS idx_attest_session ON device_attestations(session_id);
 """
+
+
+# 对旧库的增量迁移：新增列用 "duplicate column" 容错，保证重复执行幂等。
+_MIGRATIONS = [
+    "ALTER TABLE signatures ADD COLUMN device_id TEXT",
+    "ALTER TABLE signatures ADD COLUMN cert_id TEXT",
+    "ALTER TABLE signatures ADD COLUMN attest_nonce TEXT",
+]
 
 
 def now():
@@ -208,6 +322,12 @@ def init_db():
         conn = get_conn()
         try:
             conn.executescript(SCHEMA)
+            for stmt in _MIGRATIONS:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e):
+                        raise
         finally:
             conn.close()
         _initialized = True

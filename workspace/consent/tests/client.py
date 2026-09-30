@@ -10,6 +10,9 @@ import time
 import urllib.request
 import urllib.error
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import device as dm  # noqa: E402
+
 PORT = int(os.environ.get("CONSENT_TEST_PORT", "8099"))
 BASE = f"http://127.0.0.1:{PORT}"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,6 +104,46 @@ def login(login, pw):
     code, r = call("POST", "/api/auth/login", {"login": login, "password": pw})
     assert code == 200, r
     return Client(r["token"]), r["user"]
+
+
+class DevTerminal:
+    """测试用终端：持 Ed25519 私钥，可登记、领挑战、生成 attestation（Python 模拟浏览器）。"""
+    def __init__(self, inst_id, cert_role, label="测试终端"):
+        self.inst_id = inst_id
+        self.cert_role = cert_role
+        self.label = label
+        self.key = dm.DeviceKey.generate()
+        self.cert = None
+        self.device_id = None
+
+    def register(self, admin_cli):
+        c, r = admin_cli("POST", "/api/devices/register-codes",
+                         {"roles": [self.cert_role], "minutes": 60})
+        assert c == 200, (c, r)
+        csr = {"alg": "CT-REGISTER-CSR/v1", "code_ref": "", "device_label": self.label,
+               "public_hex": self.key.public_hex, "inst_id": self.inst_id}
+        c, r = call("POST", "/api/devices/register", {
+            "code": r["code"], "device_label": self.label,
+            "public_hex": self.key.public_hex,
+            "csr_sig": dm.sign_canonical(self.key, csr)})
+        assert c == 201, (c, r)
+        self.cert = r["cert"]
+        self.device_id = r["device_id"]
+        return self
+
+    def attestation(self, action, role, session_id, body_digest, inst_id=None):
+        c, r = call("POST", "/api/devices/challenge", {
+            "cert": self.cert, "action": action, "role": role,
+            "session_id": session_id, "inst_id": inst_id or self.inst_id,
+            "body_digest": body_digest})
+        assert c == 200, (c, r)
+        ch = r["challenge"]
+        sreq = dm.signing_request({**ch, "challenge_sig": r["signature"]})
+        tsig = dm.sign_canonical(self.key, sreq)
+        return {"cert": self.cert, "challenge": ch, "challenge_sig": r["signature"],
+                "terminal_sig": tsig, "cert_id": ch["cert_id"], "nonce": ch["nonce"],
+                "action": ch["action"], "session_id": ch["session_id"], "role": ch["role"],
+                "body_digest": ch["body_digest"], "inst_id": ch["inst_id"]}
 
 
 def parallel(*jobs, timeout=30):

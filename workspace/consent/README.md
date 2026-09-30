@@ -4,6 +4,32 @@
 持久化存储与 HTTP API。所有状态变更走 `BEGIN IMMEDIATE` 单事务并追加单调事件流水，
 因此签名、撤销、执行确认、材料停用等并发竞争都按**持久化先后**收敛为唯一且可说明的状态。
 
+## 设备可信证明（三入口状态变更的强制门槛）
+
+主体端（参与人）、站点端（现场负责人）与外部见证链接这三个会改变办理会话的入口，
+其每一次状态变更都必须与**本站一台已登记、未隔离、证书在有效期内且为当前代次的终端设备证明**
+在**同一笔业务事务**内原子绑定：
+
+1. **本机密钥 + 一次性注册码**：浏览器用纯 JS Ed25519（`static/shared/ed25519.js`，零依赖 BigInt）
+   本机生成密钥（私钥不出设备）；持本站现场负责人签发的一次性注册码完成登记，服务端用签发根密钥
+   签发绑定 `机构/设备/可用角色/有效期/代次` 的证书。未注册浏览器没有证书，不能改变任何会话。
+2. **挑战-响应落款**：变更前先领取服务端签名的短时挑战（钉死
+   `动作/会话/角色/内容指纹/机构/截止时间/随机数`），终端用本机私钥对完整请求签名；提交时
+   证书链、挑战签名、六+一绑定字段、终端签名逐项重算，调换机构/会话、角色或内容指纹、
+   过期挑战、越权角色、跨站设备、非本机私钥一律稳定失败。
+3. **凭据与变更同事务**：`sign/revoke/execute` 在同一 `BEGIN IMMEDIATE` 内先通过证明核验，
+   再在业务前置校验全部通过后原子占用唯一随机数并写 `device_attestations` 凭据行——
+   凭据与业务 INSERT/UPDATE 同提交或同回滚。进程在"业务落盘后、设备留痕前"这类半程崩溃，
+   因二者同事务而不可能出现；崩溃恢复不会对同一随机数生成第二次变更。
+4. **同载荷重试复用首个回执**：幂等落点是挑战随机数 + 被签署内容指纹（不含含随机因子的签名编码）。
+   同挑战同载荷（哪怕两个标签页各自独立签名）返回同一份首次结果；同随机数换内容 → `nonce_reused`。
+5. **封禁 / 旧代立即失能，历史仍可验**：隔离把设备与当前证书置 `quarantined`，轮换把旧证置
+   `rotated`、新证代次 +1；二者立刻不能再领新挑战/落款，但既有签名、许可与凭据完整保留可验。
+6. **修复前历史兼容**：`signatures` 的设备凭据三列可空，修复前已形成的签名/许可无凭据也继续可验。
+
+密码学两端字节一致：服务端 `device.py` 为纯 Python 标准库 Ed25519（RFC 8032），
+浏览器端为 BigInt 实现；RFC 8032 测试向量与跨语言互验（同密钥同消息签名逐字节相同）均通过。
+
 ## 运行
 
 ```bash
@@ -45,6 +71,16 @@ python3 tests/verify.py
 
 另有两个临时压测（见会话记录）对 12 组撤销/执行并发验证两种先后顺序都能唯一收敛。
 
+```bash
+python3 tests/test_device_attestation.py   # 40 项：设备证明门槛专项
+```
+
+设备证明专项覆盖：三入口无证明一律 `401 device_attestation_required`；注册码一次性抢占与公钥冒充；
+同载荷重试复用首个回执；调换内容指纹/角色/会话/机构、伪造挑战、非本机私钥、越权角色稳定失败；
+被封禁硬件与旧代证书立即失能、轮换授权一次性；设备审计逐条留凭据且跨站不可见；
+**两终端并发抢同一槽位只产生一笔变更与一条完成凭据、落败者随机数随事务回滚不被消费**；
+真实 SIGKILL 重启后设备/隔离/凭据存活、重放不产生第二次变更；修复前无凭据的历史许可继续可验。
+
 ## 关键设计
 
 ### 封存与版本化
@@ -79,13 +115,17 @@ python3 tests/verify.py
 ```
 consent/
 ├── server.py        # 标准库 HTTP API + 静态页路由（ThreadingHTTPServer）
-├── engine.py        # 领域引擎：发布/停用/会话/签署/评估/执行/撤销/审计（全部事务化）
-├── db.py            # SQLite 连接、schema、封存指纹与 track 键
+├── engine.py        # 领域引擎：发布/停用/会话/签署/评估/执行/撤销/设备证明/审计（全部事务化）
+├── device.py        # 纯标准库 Ed25519（RFC 8032）+ 终端证书/挑战/请求信封/规范 JSON
+├── db.py            # SQLite 连接、schema、封存指纹与 track 键、设备/凭据表与迁移
 ├── seed.py          # 空库种子（两机构、三套账号、一份封存材料）
-├── static/          # index/admin/site/subject/witness 五页 + app.js + styles.css
+├── static/
+│   ├── index/admin/site/subject/witness 五页 + app.js + styles.css
+│   └── shared/      # ed25519.js（浏览器 BigInt Ed25519）+ device-client.js（登记/挑战/签署助手）
 └── tests/
-    ├── verify.py    # 8 大场景 + 隔离附加项的端到端断言
-    └── client.py    # HTTP 客户端、并发屏障、SIGKILL 重启工具
+    ├── verify.py                    # 8 大场景 + 隔离附加项的端到端断言（58 项）
+    ├── test_device_attestation.py   # 设备可信证明门槛/并发/重启/历史兼容（40 项）
+    └── client.py                    # HTTP 客户端、并发屏障、SIGKILL 重启、DevTerminal
 ```
 
 ## 主要 API
@@ -93,6 +133,7 @@ consent/
 | 方法 路径 | 角色 | 说明 |
 |---|---|---|
 | `POST /api/auth/login` | 公开 | 登录换令牌 |
+| `GET  /api/server-key` | 公开 | 设备签发根公钥（库外核对证书/挑战/凭据） |
 | `POST /api/materials` | admin | 封存发布（变化即新版） |
 | `POST /api/materials/{id}/retire` | admin | 停用并冻结在途会话 |
 | `GET /api/materials` | admin/site | 版本列表（现场限本机构） |
@@ -100,9 +141,19 @@ consent/
 | `POST /api/subjects/{id}/sessions` | site | 对吻合的现行版开单（钉版） |
 | `GET /api/sessions` `GET /api/sessions/{sid}` | site/subject | 办理进度与具体缺项 |
 | `POST /api/sessions/{sid}/tokens` | site | 生成见证者一次性链接（旧链接失效） |
-| `POST /api/sessions/{sid}/sign` | 三类 | 参与人/现场登录签署，见证者 token 签署 |
-| `POST /api/sessions/{sid}/revoke` | subject | 撤销办理意愿或许可（幂等） |
+| `POST /api/sessions/{sid}/sign` | 三类 | 参与人/现场/见证 token 签署（**body 必带 `attestation`**） |
+| `POST /api/sessions/{sid}/revoke` | subject | 撤销办理意愿或许可（**必带 `attestation`**，幂等） |
 | `GET  /api/subjects/{id}/check?op=&purpose=` | site | 操作前查询：版本依据/获准范围/尚缺条件 |
-| `POST /api/subjects/{id}/execute` | site | 执行确认（与撤销竞争时按落盘先后） |
+| `POST /api/subjects/{id}/execute` | site | 执行确认（**必带 `attestation`**，与撤销竞争按落盘先后） |
 | `GET /api/subjects/{id}/permits` `/executions` | site/subject | 当前许可与历史记录 |
 | `GET /api/audit` | 三类 | 事件流水（按角色过滤/打码） |
+| `POST /api/devices/register-codes` `GET` | site | 签发/列出一次性设备注册码（明文仅签发时回显） |
+| `POST /api/devices/register` | 公开 | 终端凭注册码+本机公钥+CSR 自证登记 |
+| `POST /api/devices/challenge` | 终端 | 领取绑定动作/会话/角色/内容指纹/机构的短时挑战 |
+| `POST /api/devices/inspect` | 终端 | 持证书自证查询代次/隔离状态（任何代次可查） |
+| `POST /api/devices/rotate/prepare` | site | 颁发一次性轮换授权码 |
+| `POST /api/devices/rotate` | 终端 | 旧+新私钥双签完成证书代次轮换 |
+| `GET  /api/devices` | site | 本站设备与全部证书代次 |
+| `POST /api/devices/quarantine` | site | 即时隔离设备（幂等） |
+| `GET  /api/devices/audit` | site | 本站设备凭据流水（每条状态变更一条凭据） |
+
