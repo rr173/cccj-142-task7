@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS sessions(
   material_id INTEGER NOT NULL REFERENCES materials(id),
   track_key TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('open','completed','withdrawn','blocked')),
+  device_id TEXT,
+  credential_id TEXT,
+  attestation_id INTEGER,
   created_at TEXT NOT NULL,
   completed_at TEXT,
   withdrawn_at TEXT,
@@ -96,6 +99,10 @@ CREATE TABLE IF NOT EXISTS signatures(
   signer_name TEXT NOT NULL,
   body_hash TEXT NOT NULL,                    -- 签署时核对的封存指纹
   sig_hash TEXT NOT NULL UNIQUE,              -- (会话,角色,落款人,指纹) 去重
+  device_id TEXT,
+  credential_id TEXT,
+  attestation_id INTEGER,
+  request_hash TEXT,
   created_at TEXT NOT NULL                    -- 只写不改
 );
 
@@ -126,6 +133,10 @@ CREATE TABLE IF NOT EXISTS executions(
   version INTEGER,
   result TEXT NOT NULL CHECK(result IN ('performed','denied')),
   reason TEXT,
+  device_id TEXT,
+  credential_id TEXT,
+  attestation_id INTEGER,
+  request_hash TEXT,
   created_at TEXT NOT NULL
 );
 -- “新增用途”同一 (对象,操作,用途) 只允许形成一次合法记录；常规操作 purpose 为 NULL 不受限
@@ -147,19 +158,121 @@ CREATE TABLE IF NOT EXISTS events(
 );
 
 -- 客户端幂等键 -> 首次结果；两个终端重复提交取首次结果
-CREATE TABLE IF NOT EXISTS idempotents(
-  key TEXT PRIMARY KEY,
-  scope TEXT NOT NULL,                        -- 例如 sign:<session>:<role>
-  response_code INTEGER NOT NULL,
-  response_body TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS auth_tokens(
   token TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id),
   created_at TEXT NOT NULL
 );
+"""
+
+TRUST_SCHEMA = r"""
+-- 可信终端：一台浏览器/硬件在一个主体维度下登记，换代保留旧公钥用于审计，
+-- 设备停用会同时让当前代凭据失效。
+CREATE TABLE IF NOT EXISTS devices(
+  id TEXT PRIMARY KEY,
+  owner_type TEXT NOT NULL CHECK(owner_type IN ('user','witness')),
+  user_id TEXT REFERENCES users(id),
+  inst_id TEXT REFERENCES institutions(id),
+  slot_id INTEGER REFERENCES sign_slots(id),
+  hardware_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('active','revoked')),
+  current_credential_id TEXT,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  revoke_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_hardware
+  ON devices(user_id, hardware_id) WHERE owner_type='user';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_witness_hardware
+  ON devices(slot_id, hardware_id) WHERE owner_type='witness';
+
+CREATE TABLE IF NOT EXISTS device_credentials(
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  generation INTEGER NOT NULL,
+  user_id TEXT REFERENCES users(id),
+  inst_id TEXT REFERENCES institutions(id),
+  slot_id INTEGER REFERENCES sign_slots(id),
+  public_jwk_json TEXT NOT NULL,
+  public_key_hash TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('active','rotated','revoked')),
+  not_after TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  rotated_at TEXT,
+  revoked_at TEXT,
+  UNIQUE(device_id, generation)
+);
+CREATE INDEX IF NOT EXISTS idx_device_cred_device ON device_credentials(device_id, status);
+
+-- 一次性登记/轮换授权：只存哈希，明文仅在签发响应中出现一次。
+CREATE TABLE IF NOT EXISTS device_enrollments(
+  code_hash TEXT PRIMARY KEY,
+  purpose TEXT NOT NULL CHECK(purpose IN ('register','rotate')),
+  owner_type TEXT CHECK(owner_type IN ('user','witness')),
+  user_id TEXT REFERENCES users(id),
+  inst_id TEXT REFERENCES institutions(id),
+  slot_id INTEGER REFERENCES sign_slots(id),
+  credential_id TEXT REFERENCES device_credentials(id),
+  status TEXT NOT NULL CHECK(status IN ('issued','used','revoked')),
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  used_at TEXT,
+  resulting_device_id TEXT REFERENCES devices(id),
+  resulting_credential_id TEXT REFERENCES device_credentials(id)
+);
+
+-- 短时挑战与一次性随机数；消费和业务状态在同一个 BEGIN IMMEDIATE 中完成。
+CREATE TABLE IF NOT EXISTS device_challenges(
+  id TEXT PRIMARY KEY,
+  nonce TEXT NOT NULL,
+  credential_id TEXT NOT NULL REFERENCES device_credentials(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  action TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  role TEXT,
+  body_digest TEXT,
+  witness_token_hash TEXT,
+  status TEXT NOT NULL CHECK(status IN ('issued','consumed')),
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  consumed_at TEXT,
+  UNIQUE(credential_id, nonce)
+);
+CREATE INDEX IF NOT EXISTS idx_challenge_live
+  ON device_challenges(status, expires_at);
+
+-- 每次实际业务状态变更对应的设备证明；重放/只读幂等不生成第二条。
+CREATE TABLE IF NOT EXISTS device_attestations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  challenge_id TEXT NOT NULL REFERENCES device_challenges(id),
+  credential_id TEXT NOT NULL REFERENCES device_credentials(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  generation INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  resource TEXT NOT NULL,
+  role TEXT,
+  request_hash TEXT NOT NULL,
+  terminal_signature TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attest_device ON device_attestations(device_id, id);
+CREATE INDEX IF NOT EXISTS idx_attest_credential ON device_attestations(credential_id, id);
+"""
+
+IDEMPOTENTS_SCHEMA = r"""
+CREATE TABLE IF NOT EXISTS idempotents(
+  key TEXT NOT NULL,
+  scope TEXT NOT NULL,                        -- 例如 sign:<session>:<role>
+  credential_id TEXT NOT NULL REFERENCES device_credentials(id),
+  device_id TEXT NOT NULL REFERENCES devices(id),
+  request_hash TEXT NOT NULL,
+  response_code INTEGER NOT NULL,
+  response_body TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (key, scope)
+);
+CREATE INDEX IF NOT EXISTS idx_idempotents_credential ON idempotents(credential_id, created_at);
 """
 
 
@@ -200,6 +313,43 @@ def begin_tx(conn):
     conn.execute("BEGIN IMMEDIATE")
 
 
+def _columns(conn, table):
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate_schema(conn):
+    """把修复前数据库补齐到新 schema；旧业务记录保持可验，不回填不存在的设备证明。"""
+    additions = {
+        "sessions": [
+            ("device_id", "TEXT"),
+            ("credential_id", "TEXT"),
+            ("attestation_id", "INTEGER"),
+        ],
+        "signatures": [
+            ("device_id", "TEXT"),
+            ("credential_id", "TEXT"),
+            ("attestation_id", "INTEGER"),
+            ("request_hash", "TEXT"),
+        ],
+        "executions": [
+            ("device_id", "TEXT"),
+            ("credential_id", "TEXT"),
+            ("attestation_id", "INTEGER"),
+            ("request_hash", "TEXT"),
+        ],
+    }
+    for table, cols in additions.items():
+        existing = _columns(conn, table)
+        for name, decl in cols:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    # 旧幂等表没有设备/载荷绑定，无法安全复用；保留为审计线索，新表在信任表建完后创建。
+    old_idem = _columns(conn, "idempotents")
+    if old_idem and ("credential_id" not in old_idem or "request_hash" not in old_idem):
+        conn.execute("ALTER TABLE idempotents RENAME TO idempotents_legacy")
+
+
 def init_db():
     global _initialized
     with _lock:
@@ -208,6 +358,9 @@ def init_db():
         conn = get_conn()
         try:
             conn.executescript(SCHEMA)
+            _migrate_schema(conn)
+            conn.executescript(TRUST_SCHEMA)
+            conn.executescript(IDEMPOTENTS_SCHEMA)
         finally:
             conn.close()
         _initialized = True

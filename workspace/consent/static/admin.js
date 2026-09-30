@@ -1,5 +1,22 @@
 boot("admin", "app", async main => {
-  main.innerHTML = `
+  const deviceCard = `
+  <div class="card">
+    <h2>可信终端登记 / 停用 / 审计</h2>
+    <div class="row">
+      <div><label>账号 ID</label><input id="devUserId" placeholder="u-site-a / u-wang"></div>
+      <div><label>&nbsp;</label><button id="btnEnrollDevice">签发一次性登记授权</button></div>
+    </div>
+    <div id="enrollDeviceMsg"></div>
+    <div class="row">
+      <div><label>停用设备号</label><input id="revokeDeviceId" placeholder="D-..."></div>
+      <div><label>原因</label><input id="revokeDeviceReason" placeholder="硬件封禁/遗失"></div>
+      <div><label>&nbsp;</label><button id="btnRevokeDevice" class="danger">停用设备</button></div>
+    </div>
+    <div id="revokeDeviceMsg"></div>
+    <button id="btnDeviceAudit" class="ghost">刷新设备审计</button>
+    <pre id="deviceAudit" class="hash" style="max-height:260px;overflow:auto"></pre>
+  </div>`;
+  main.innerHTML = deviceCard + `
   <div class="card">
     <h2>发布 / 另立版本（发布即封存正文、语种、适用条件、必签角色、允许操作）</h2>
     <div class="row">
@@ -52,6 +69,28 @@ boot("admin", "app", async main => {
     <tbody id="auditRows"></tbody></table>
   </div>`;
 
+  document.getElementById("btnEnrollDevice").onclick = async () => {
+    const box = document.getElementById("enrollDeviceMsg");
+    try {
+      const r = await api("POST", "/api/admin/device-enrollments",
+        { user_id: document.getElementById("devUserId").value.trim() });
+      okbox(box, `一次性登记授权（请安全转交，仅显示一次）：${r.enrollment_code}`);
+    } catch (e) { toast(box, e); }
+  };
+  document.getElementById("btnRevokeDevice").onclick = async () => {
+    const box = document.getElementById("revokeDeviceMsg");
+    try {
+      const r = await api("POST", "/api/devices/revoke", {
+        device_id: document.getElementById("revokeDeviceId").value.trim(),
+        reason: document.getElementById("revokeDeviceReason").value.trim(),
+      });
+      okbox(box, r.idempotent ? "设备此前已停用" : `设备 ${r.device_id} 已停用`);
+    } catch (e) { toast(box, e); }
+  };
+  document.getElementById("btnDeviceAudit").onclick = async () => {
+    const r = await api("GET", "/api/device-audit?limit=100");
+    document.getElementById("deviceAudit").textContent = JSON.stringify(r, null, 2);
+  };
   const insts = await api("GET", "/api/institutions");
   document.getElementById("f_inst").innerHTML =
     insts.map(i => `<option value="${i.id}">${esc(i.id)} · ${esc(i.name)}</option>`).join("");

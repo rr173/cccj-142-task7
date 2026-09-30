@@ -71,7 +71,8 @@ boot("site", "app", async main => {
       </tr>`).join("");
     document.querySelectorAll("[data-start]").forEach(b => b.onclick = async () => {
       try {
-        await api("POST", `/api/subjects/${current.id}/sessions`, { material_id: Number(b.dataset.start) });
+        await TRUST.send("POST", `/api/subjects/${current.id}/sessions`, { material_id: Number(b.dataset.start) },
+          { action: "session.start", resource: current.id });
         await refreshAll();
       } catch (e) { alert(e.message); }
     });
@@ -99,18 +100,20 @@ boot("site", "app", async main => {
 
     document.querySelectorAll("[data-sign]").forEach(b => b.onclick = async () => {
       try {
-        await api("POST", `/api/sessions/${b.dataset.sign}/sign`, { role: "site_owner" });
+        await TRUST.send("POST", `/api/sessions/${b.dataset.sign}/sign`, { role: "site_owner" },
+          { action: "sign", resource: b.dataset.sign, role: "site_owner" });
         await refreshAll();
       } catch (e) { alert(e.message); }
     });
     document.querySelectorAll("[data-tokens]").forEach(b => b.onclick = async () => {
       try {
-        const r = await api("POST", `/api/sessions/${b.dataset.tokens}/tokens`, {});
+        const r = await TRUST.send("POST", `/api/sessions/${b.dataset.tokens}/tokens`, {},
+          { action: "witness.tokens", resource: b.dataset.tokens });
         const links = Object.entries(r.tokens).map(([role, tk]) =>
           `<div>${ROLE_LABELS[role]} 一次性签名链接：
-            <a href="/witness.html?session=${r.session_id}&role=${role}&token=${tk}" target="_blank">
-            /witness.html?session=${r.session_id}&role=${role}&token=…</a>
-            <div class="hash">${tk}</div></div>`).join("");
+            <a href="/witness.html?session=${r.session_id}&role=${role}&token=${tk}&enrollment=${r.enrollment_codes[role]}" target="_blank">
+            /witness.html?session=${r.session_id}&role=${role}&token=…&enrollment=…</a>
+            <div class="hash">${tk} / ${r.enrollment_codes[role]}</div></div>`).join("");
         document.getElementById("tk-" + b.dataset.tokens).innerHTML =
           `<div class="okbox">${links || "暂无待签角色"}</div>`;
       } catch (e) { alert(e.message); }
@@ -131,7 +134,8 @@ boot("site", "app", async main => {
     const purpose = document.getElementById("purpose").value || null;
     try {
       if (doExecute) {
-        const r = await api("POST", `/api/subjects/${current.id}/execute`, { op, purpose });
+        const r = await TRUST.send("POST", `/api/subjects/${current.id}/execute`,
+          { op, purpose }, { action: "execute", resource: current.id });
         box.innerHTML = r.result === "performed"
           ? `<div class="okbox">✅ 已执行确认（#${r.execution_id}），依据 ${esc(r.basis.family)} v${r.basis.version}
              <div class="hash">${esc(r.basis.body_hash.slice(0, 20))}…</div>获准范围：${opList(r.scope)}</div>`

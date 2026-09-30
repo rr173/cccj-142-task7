@@ -2,6 +2,8 @@
 import json
 import os
 import re
+import base64
+import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -96,6 +98,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _attestation(self):
+        raw = self.headers.get("X-Device-Attestation")
+        if not raw:
+            return None
+        try:
+            value = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+            return value if isinstance(value, dict) else None
+        except Exception:
+            raise EngineError("device_attestation_invalid", "设备证明不是合法 JSON", 400)
+
+    def _challenge_principal(self, body):
+        """挑战接口：见证者只出示一次性链接，其他主体必须登录。"""
+        if body.get("action") == "sign" and body.get("role") == "witness":
+            return None
+        return self._principal()
+
+    def _with_device_gateway(self, conn, action, resource, body, business):
+        idem = body.get("idempotency_key") or self.headers.get("Idempotency-Key")
+        for attempt in range(2):
+            try:
+                state = engine.begin_attested_state(
+                    conn, action=action, resource=resource, body=body,
+                    idem_key=idem, attestation=self._attestation())
+                if state.get("replayed"):
+                    return state["code"], state["reply"]
+                return business(state["ctx"], idem)
+            except sqlite3.IntegrityError:
+                # 并发失败者在首个事务释放写锁后重读同一幂等键，回放唯一首次结果。
+                conn.rollback()
+                if attempt:
+                    raise
 
     # ---------- 路由 ----------
     def do_GET(self):
@@ -205,6 +239,36 @@ class Handler(BaseHTTPRequestHandler):
                                                     body.get("password", ""))
                     return self._send(200, {"token": tok, "user": self._safe_user(user)})
 
+                if path == "/api/devices/challenge":
+                    p = self._challenge_principal(body)
+                    return self._send(201, engine.create_challenge(
+                        conn, body, principal=p))
+
+                if path == "/api/devices/register":
+                    return self._send(201, engine.register_device(conn, body))
+
+                if path == "/api/devices/rotate-code":
+                    p = self._principal()
+                    return self._send(200, engine.create_rotation_enrollment(
+                        conn, p, body.get("credential_id")))
+
+                if path == "/api/devices/revoke":
+                    p = self._principal()
+                    return self._send(200, engine.revoke_device(
+                        conn, p, body.get("device_id"), body.get("reason", "")))
+
+                if path == "/api/device-audit":
+                    p = self._principal()
+                    q = self._qs()
+                    return self._send(200, engine.list_device_audit(
+                        conn, p, inst_id=q.get("inst_id"), device_id=q.get("device_id"),
+                        limit=q.get("limit", 200)))
+
+                if path == "/api/admin/device-enrollments":
+                    p = self._principal()
+                    return self._send(201, engine.create_user_enrollment(
+                        conn, p, body.get("user_id")))
+
                 if path == "/api/materials":
                     p = self._principal()
                     m = engine.publish_material(
@@ -226,44 +290,51 @@ class Handler(BaseHTTPRequestHandler):
                     p = self._principal()
                     s = engine.get_subject(conn, m.group(1))
                     self._guard_subject(conn, p, s)
-                    return self._send(201, engine.start_session(
-                        conn, s["id"], int(body["material_id"]), p))
+                    return self._send(*self._with_device_gateway(
+                        conn, "session.start", m.group(1), body,
+                        lambda ctx, _idem: (201, engine.start_session(
+                            conn, m.group(1), int(body["material_id"]), p,
+                            attested_ctx=ctx))))
 
                 m = _PAT["session_tokens"].match(path)
                 if m:
                     p = self._principal()
                     engine.get_session(conn, m.group(1), p)
-                    return self._send(200, engine.slot_tokens(conn, m.group(1), p))
+                    return self._send(*self._with_device_gateway(
+                        conn, "witness.tokens", m.group(1), body,
+                        lambda ctx, _idem: (200, engine.slot_tokens(
+                            conn, m.group(1), p, attested_ctx=ctx))))
 
                 m = _PAT["session_sign"].match(path)
                 if m:
-                    # 见证者可持一次性令牌免登录；参与人/现场负责人必须登录
+                    # 见证者可持一次性令牌免登录；参与人/现场负责人必须登录。
+                    # 三者都必须先在本站有效设备上完成挑战-响应。
                     p = self._principal(required=(body.get("role") != "witness"))
-                    code, resp = engine.sign(
-                        conn, m.group(1), body.get("role"),
-                        signer_name=body.get("signer_name"), token=body.get("token"),
-                        principal=p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
-                    return self._send(code, resp)
+                    return self._send(*self._with_device_gateway(
+                        conn, "sign", m.group(1), body,
+                        lambda ctx, _idem: engine.sign(
+                            conn, m.group(1), body.get("role"),
+                            signer_name=body.get("signer_name"), token=body.get("token"),
+                            principal=p, idem_key=_idem, attested_ctx=ctx)))
 
                 m = _PAT["session_revoke"].match(path)
                 if m:
                     p = self._principal()
-                    code, resp = engine.revoke(
-                        conn, m.group(1), p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
-                    return self._send(code, resp)
+                    return self._send(*self._with_device_gateway(
+                        conn, "revoke", m.group(1), body,
+                        lambda ctx, idem: engine.revoke(
+                            conn, m.group(1), p, idem_key=idem, attested_ctx=ctx)))
 
                 m = _PAT["subject_execute"].match(path)
                 if m:
                     p = self._principal()
                     s = engine.get_subject(conn, m.group(1))
                     self._guard_subject(conn, p, s)
-                    code, resp = engine.execute(
-                        conn, s["id"], body.get("op"), purpose=body.get("purpose"),
-                        principal=p,
-                        idem_key=body.get("idempotency_key") or self.headers.get("Idempotency-Key"))
-                    return self._send(code, resp)
+                    return self._send(*self._with_device_gateway(
+                        conn, "execute", s["id"], body,
+                        lambda ctx, idem: engine.execute(
+                            conn, s["id"], body.get("op"), purpose=body.get("purpose"),
+                            principal=p, idem_key=idem, attested_ctx=ctx)))
 
                 raise EngineError("not_found", "接口不存在", 404)
             finally:

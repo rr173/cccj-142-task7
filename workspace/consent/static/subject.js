@@ -61,7 +61,8 @@ boot("subject", "app", async main => {
     document.querySelectorAll("[data-sign]").forEach(b => b.onclick = async () => {
       const box = document.getElementById("msg-" + b.dataset.sign);
       try {
-        const r = await api("POST", `/api/sessions/${b.dataset.sign}/sign`, { role: "subject" });
+        const r = await TRUST.send("POST", `/api/sessions/${b.dataset.sign}/sign`, { role: "subject" },
+          { action: "sign", resource: b.dataset.sign, role: "subject" });
         okbox(box, r.result === "completed"
           ? `已签署且全部角色齐备，许可 ${r.permit_id} 已生成。`
           : "已记录你的签署。");
@@ -72,7 +73,8 @@ boot("subject", "app", async main => {
       if (!confirm("确认撤销？撤销前已执行的记录保留，之后的新操作/新增用途会被拒绝。")) return;
       const box = document.getElementById("msg-" + b.dataset.revoke);
       try {
-        const r = await api("POST", `/api/sessions/${b.dataset.revoke}/revoke`, {});
+        const r = await TRUST.send("POST", `/api/sessions/${b.dataset.revoke}/revoke`, {},
+          { action: "revoke", resource: b.dataset.revoke });
         okbox(box, "结果：" + r.result);
         await refresh();
       } catch (e) { toast(box, e); }
